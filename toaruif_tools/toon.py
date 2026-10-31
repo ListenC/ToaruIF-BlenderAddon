@@ -43,8 +43,10 @@ Each face that may grow an edge is duplicated, welded smooth, pushed along its
 normal by a distance proportional to its depth from the camera and then flipped;
 the projection divides by the same depth, so the line keeps a constant width in
 *pixels* whatever the framing.  The width is driven from the lens / sensor /
-resolution, so a close-up no longer turns the line into a fat band.  Faces of
-eyes, brows, lashes and mouth are flagged out of the hull by a face attribute.
+resolution, so a close-up no longer turns the line into a fat band.  In the 3D
+view the reference point is the view origin instead of the render camera, so
+scrolling in and out of the viewport keeps the same width too.  Faces of eyes,
+brows, lashes and mouth are flagged out of the hull by a face attribute.
 """
 
 import math
@@ -60,7 +62,7 @@ OUTLINE_MODIFIER = "ToaruIF-描边"
 OUTLINE_GROUP = "ToaruIF-描边节点"
 #: Bump whenever the node layout changes; the group is then rebuilt instead of
 #: reused, which keeps .blend files made by an older version working.
-GROUP_VERSION = 4
+GROUP_VERSION = 5
 #: Per-face boolean written on the mesh: this face may grow an outline.
 EDGE_ATTRIBUTE = "toaruif_edge"
 #: Left behind by v0.5.0, which borrowed mmd_tools' edge preview.  Only used to
@@ -490,7 +492,10 @@ def outline_group():
     The camera is fed in as a plain *position* that the modifier drives from
     ``scene.camera``; a captured Object pointer would go stale as soon as the
     scene camera is swapped, which is exactly when the width would silently
-    drift again.
+    drift again.  In the viewport the render camera is not what is being
+    looked through -- scrolling dollies the view origin along the view axis --
+    so there the depth is measured from the view matrix instead.  A final
+    render reports ``Is Viewport`` as false and keeps using the camera.
     """
     group = bpy.data.node_groups.get(OUTLINE_GROUP)
     if group is not None and group.get("version") == GROUP_VERSION:
@@ -581,10 +586,47 @@ def outline_group():
     links.new(world.outputs["Vector"], distance.inputs[0])
     links.new(source.outputs["相机位置"], distance.inputs[1])
 
+    # --- the depth that is actually on screen -----------------------------
+    # A render looks through ``scene.camera``, but the 3D view can be zoomed
+    # anywhere: the scroll wheel dollies the view origin along the view axis
+    # while the camera stays put, so a camera based depth makes the line grow
+    # as the user zooms in -- the complaint this fixes.  Viewport Transform
+    # reports the matrix of whatever is being drawn, so its inverse applied to
+    # the origin is the point to measure depth from.  It is only meaningful in
+    # the viewport, hence the switch; the minimum keeps a line that never turns
+    # into a fat band even when a release hands back an empty matrix.
+    depth_value = distance.outputs["Value"]
+    try:
+        viewport = nodes.new("GeometryNodeViewportTransform")
+        in_viewport = nodes.new("GeometryNodeIsViewport")
+        invert = nodes.new("FunctionNodeInvertMatrix")
+        view_origin = nodes.new("ShaderNodeCombineXYZ")  # (0, 0, 0)
+        to_world = nodes.new("FunctionNodeTransformPoint")
+        view_distance = nodes.new("ShaderNodeVectorMath")
+        nearest = nodes.new("ShaderNodeMath")
+        choose = nodes.new("GeometryNodeSwitch")
+        choose.input_type = "FLOAT"
+
+        links.new(viewport.outputs["View"], invert.inputs["Matrix"])
+        links.new(view_origin.outputs["Vector"], to_world.inputs["Vector"])
+        links.new(invert.outputs["Matrix"], to_world.inputs["Transform"])
+        view_distance.operation = "DISTANCE"
+        links.new(world.outputs["Vector"], view_distance.inputs[0])
+        links.new(to_world.outputs["Vector"], view_distance.inputs[1])
+        nearest.operation = "MINIMUM"
+        links.new(view_distance.outputs["Value"], nearest.inputs[0])
+        links.new(distance.outputs["Value"], nearest.inputs[1])
+        links.new(in_viewport.outputs["Is Viewport"], choose.inputs["Switch"])
+        links.new(distance.outputs["Value"], choose.inputs["False"])  # render
+        links.new(nearest.outputs[0], choose.inputs["True"])          # viewport
+        depth_value = choose.outputs[0]
+    except (RuntimeError, KeyError, AttributeError):
+        pass  # 3.6 has no viewport transform node; the camera depth stands
+
     # --- width: k is "world units per unit of depth" ----------------------
     width = nodes.new("ShaderNodeMath")
     width.operation = "MULTIPLY"
-    links.new(distance.outputs["Value"], width.inputs[0])
+    links.new(depth_value, width.inputs[0])
     links.new(source.outputs["k"], width.inputs[1])
 
     # The push happens in local space, so the world width is divided by the
