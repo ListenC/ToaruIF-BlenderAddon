@@ -38,10 +38,13 @@ That makes the look deterministic -- rotating the view does not turn the
 character into a different time of day -- and the ``_ToonShadeMask`` still moves
 the break per texel through the mask's green channel.
 
-The outline also follows BV-Toon: mmd_tools' own ``edge_preview_setup`` builds
-one inverted-hull modifier per mesh plus a ``mmd_edge.<material>`` shell material
-per slot, so every material keeps its own colour.  Materials that must not grow
-an edge (eyes, brows, lashes, mouth) get their shell vertex weights zeroed out.
+The outline is an inverted hull built in geometry nodes, not a solidify shell.
+Each face that may grow an edge is duplicated, welded smooth, pushed along its
+normal by a distance proportional to its depth from the camera and then flipped;
+the projection divides by the same depth, so the line keeps a constant width in
+*pixels* whatever the framing.  The width is driven from the lens / sensor /
+resolution, so a close-up no longer turns the line into a fat band.  Faces of
+eyes, brows, lashes and mouth are flagged out of the hull by a face attribute.
 """
 
 import math
@@ -54,11 +57,16 @@ TOON_KEY = "toaruif_toon_style"
 MASK_SUFFIX = "_mask"
 OUTLINE_MATERIAL = "ToaruIF-描边"
 OUTLINE_MODIFIER = "ToaruIF-描边"
-EDGE_MODIFIER = "mmd_edge_preview"
-EDGE_MATERIAL_PREFIX = "mmd_edge."
-#: mmd_tools bakes this weight into ``mmd_edge_preview``; a vertex weighted 1.0
-#: therefore only gets 2% of the modifier thickness as real shell.
-EDGE_WEIGHT_FACTOR = 0.02
+OUTLINE_GROUP = "ToaruIF-描边节点"
+#: Bump whenever the node layout changes; the group is then rebuilt instead of
+#: reused, which keeps .blend files made by an older version working.
+GROUP_VERSION = 4
+#: Per-face boolean written on the mesh: this face may grow an outline.
+EDGE_ATTRIBUTE = "toaruif_edge"
+#: Left behind by v0.5.0, which borrowed mmd_tools' edge preview.  Only used to
+#: clean those files up when the preset is re-applied.
+LEGACY_EDGE_MODIFIER = "mmd_edge_preview"
+LEGACY_EDGE_PREFIX = "mmd_edge."
 
 # Constants read out of the shipped character materials
 # (model_base_004000901_* / 004001501_* in the asset bundles).  They are the
@@ -78,10 +86,29 @@ BREAK_CENTRE = 0.05
 RIM_COLOR = (1.0, 1.0, 1.0, 1.0)  # _RimColor
 RIM_SCALE = 0.0           # _RimScale -- 0 in the assets; see the note below
 RIM_OFFSET = 0.0          # _RimOffset -- shifts where the rim starts
-# _OutlineColor is a warm brown, not black.  _OutlineScaleTer is 0.05 and
-# _OutlineOffsetTer 0.1, but those are shader-space factors, so the metre
-# value below stays hand tuned.
-OUTLINE_COLOR = (0.208, 0.114, 0.0, 1.0)
+
+
+def _srgb_to_linear(color):
+    """A measured sRGB triple as linear scene values.
+
+    Shader colour properties (emission, base colour, solid-view colour) are
+    linear.  Feeding a screenshot value such as 0.208 straight in displays it
+    as a bright olive, which is why the outline needs this conversion.
+    """
+    def channel(value):
+        value = max(0.0, min(1.0, value))
+        if value <= 0.04045:
+            return value / 12.92
+        return ((value + 0.055) / 1.055) ** 2.4
+
+    linear = tuple(channel(c) for c in color[:3])
+    return linear + (color[3] if len(color) > 3 else 1.0,)
+
+
+# _OutlineColor is a warm brown, not black.  This is the value measured in the
+# game (sRGB); the linear form below is what the materials actually store.
+OUTLINE_COLOR_SRGB = (0.208, 0.114, 0.0, 1.0)
+OUTLINE_COLOR = _srgb_to_linear(OUTLINE_COLOR_SRGB)
 #: Materials that never grow an outline.  The PMX edge flag already covers
 #: most models; these name hints catch the rest (eyes and brows painted onto
 #: the face texture by the game's art team).
@@ -107,9 +134,12 @@ STYLES = {
     },
 }
 
-# Outline width in Blender units (metres) measured on the finished shell.
-# 1.8 mm reads as a thin anime line; above ~3 mm starts swallowing fingers.
-OUTLINE_WIDTH = 0.0018
+# Outline width in *rendered pixels*, not metres.  A solidify shell has a world
+# space thickness, so one fixed number draws a hairline in a full-body shot and
+# a thick band as soon as the camera moves in.  The modifier thickness is
+# therefore driven from the camera distance and the focal terms, which keeps
+# the line the same few pixels at any framing.
+OUTLINE_PIXELS = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -397,59 +427,412 @@ def build_toon_material(material, base_image, mask_image, style_key, style,
 # ---------------------------------------------------------------------------
 
 def outline_material(color=OUTLINE_COLOR):
-    """Fallback hull material, used only when mmd_tools is not available."""
+    """The one inverted-hull material, shared by every outline face.
+
+    The hull is pushed outward and its faces are flipped, so their normals point
+    into the model.  Back-face culling is therefore *on*: the shell disappears
+    over the surface and only the rim -- where those inverted faces turn edge-on
+    -- is left over, which is exactly the silhouette line.
+    """
     material = bpy.data.materials.get(OUTLINE_MATERIAL)
     if material is None:
         material = bpy.data.materials.new(OUTLINE_MATERIAL)
         material.use_nodes = True
-        material.use_backface_culling = True
         tree = material.node_tree
         tree.nodes.clear()
         output = tree.nodes.new("ShaderNodeOutputMaterial")
         emit = tree.nodes.new("ShaderNodeEmission")
         tree.links.new(emit.outputs["Emission"], output.inputs["Surface"])
         material.use_fake_user = True
+    # Eevee Next split this flag per pass; 4.2+ exposes the surface one separately.
+    for attribute in ("use_backface_culling", "use_backface_culling_surface"):
+        if hasattr(material, attribute):
+            setattr(material, attribute, True)
     if material.node_tree is not None:
         for node in material.node_tree.nodes:
             if node.bl_idname == "ShaderNodeEmission":
                 node.inputs["Color"].default_value = color
                 break
     # Solid shading reads the viewport colour, not the node tree; without this
-    # the hull shows up as light grey instead of an outline.
+    # the outline shows up as light grey.
     material.diffuse_color = color
     return material
 
 
-def add_hull_outline(obj, thickness, color=OUTLINE_COLOR):
-    """Inverted-hull outline through Solidify's flipped normals.
+def _field_output(node, name, kind):
+    """The socket of ``name``/``kind``; 3.6 lists one attribute output per type."""
+    sockets = [socket for socket in node.outputs if socket.name == name]
+    for socket in sockets:
+        if socket.type == kind:
+            return socket
+    return sockets[0]
 
-    ``use_even_offset`` stays off on purpose: it normalises the offset by the
-    angle to the neighbouring face, so the near-degenerate triangles around the
-    fingers get a huge displacement and shoot long black splinters out of the
-    hand.
+
+def _euler_of(nodes, links, rotation_socket):
+    """Object Info reports an Euler in 3.6 and a Rotation from 4.x on."""
+    if rotation_socket.type != "ROTATION":
+        return rotation_socket
+    convert = nodes.new("FunctionNodeRotationToEuler")
+    links.new(rotation_socket, convert.inputs["Rotation"])
+    return convert.outputs[0]
+
+
+def outline_group():
+    """The geometry-node hull, built once per .blend file.
+
+    Every outline face is copied, the copy is pushed along its normal by
+    ``k * distance to the camera`` and then flipped.  That is the whole trick:
+    the projection divides by the same depth the offset multiplies by, so the
+    rim keeps a constant *pixel* width at any framing.  A Solidify shell is a
+    world-space thickness instead and can only be right at one depth, which is
+    why a close-up used to turn the line into a fat, mushy band.
+
+    The camera is fed in as a plain *position* that the modifier drives from
+    ``scene.camera``; a captured Object pointer would go stale as soon as the
+    scene camera is swapped, which is exactly when the width would silently
+    drift again.
     """
-    material = outline_material(color)
-    slots = list(obj.material_slots)
-    if not slots or slots[0].material is None:
+    group = bpy.data.node_groups.get(OUTLINE_GROUP)
+    if group is not None and group.get("version") == GROUP_VERSION:
+        return group
+    if group is not None:
+        bpy.data.node_groups.remove(group)
+    tree = bpy.data.node_groups.new(OUTLINE_GROUP, "GeometryNodeTree")
+    tree.use_fake_user = True
+    nodes = tree.nodes
+    links = tree.links
+
+    def add_socket(name, in_out, kind):
+        interface = getattr(tree, "interface", None)
+        if interface is not None and hasattr(interface, "new_socket"):
+            return interface.new_socket(name=name, in_out=in_out, socket_type=kind)
+        # 3.6 still builds the interface from the two legacy collections.
+        collection = tree.outputs if in_out == "OUTPUT" else tree.inputs
+        return collection.new(kind, name)
+
+    add_socket("Geometry", "INPUT", "NodeSocketGeometry")
+    self_socket = add_socket("物体", "INPUT", "NodeSocketObject")
+    camera_socket = add_socket("相机位置", "INPUT", "NodeSocketVector")
+    material_socket = add_socket("描边材质", "INPUT", "NodeSocketMaterial")
+    k_socket = add_socket("k", "INPUT", "NodeSocketFloat")
+    add_socket("Geometry", "OUTPUT", "NodeSocketGeometry")
+
+    source = nodes.new("NodeGroupInput")
+    sink = nodes.new("NodeGroupOutput")
+
+    # --- which faces grow an outline -------------------------------------
+    named = nodes.new("GeometryNodeInputNamedAttribute")
+    if hasattr(named, "data_type"):
+        try:
+            named.data_type = "BOOLEAN"
+        except TypeError:  # release without that hint
+            pass
+    named.inputs["Name"].default_value = EDGE_ATTRIBUTE
+    duplicate = nodes.new("GeometryNodeDuplicateElements")
+    duplicate.domain = "FACE"
+    links.new(_field_output(named, "Attribute", "BOOLEAN"),
+              duplicate.inputs["Selection"])
+    links.new(source.outputs["Geometry"], duplicate.inputs["Geometry"])
+
+    # Weld the copy back together and shade it smooth.  The PMX mesh is flat
+    # shaded with split vertices, so each face carries its own normal; pushing
+    # every face along its own normal tears the shell into separate quads whose
+    # stray sides then show up as brown dashes across the hair.  Averaging the
+    # normals over the welded copy keeps the shell one continuous surface, which
+    # is the standard inverted-hull setup.
+    welded = nodes.new("GeometryNodeMergeByDistance")
+    welded.inputs["Distance"].default_value = 1e-4
+    links.new(duplicate.outputs["Geometry"], welded.inputs[0])
+
+    smooth = nodes.new("GeometryNodeSetShadeSmooth")
+    smooth.inputs["Shade Smooth"].default_value = True
+    links.new(welded.outputs["Geometry"], smooth.inputs[0])
+
+    # --- depth: the local vertex has to be measured in world space --------
+    # Geometry nodes run on local coordinates, so the camera distance is only
+    # right once the object's own matrix (location, rotation and the 0.08
+    # import scale) is applied.  Object Info carries that matrix live, so
+    # moving or turning the model keeps the shell correct without re-applying
+    # the preset.
+    info = nodes.new("GeometryNodeObjectInfo")
+    links.new(source.outputs["物体"], info.inputs["Object"])
+
+    position = nodes.new("GeometryNodeInputPosition")
+    normal = nodes.new("GeometryNodeInputNormal")
+
+    scaled = nodes.new("ShaderNodeVectorMath")
+    scaled.operation = "MULTIPLY"
+    links.new(position.outputs["Position"], scaled.inputs[0])
+    links.new(info.outputs["Scale"], scaled.inputs[1])
+
+    turned = nodes.new("ShaderNodeVectorRotate")
+    turned.rotation_type = "EULER_XYZ"
+    links.new(scaled.outputs["Vector"], turned.inputs["Vector"])
+    links.new(_euler_of(nodes, links, info.outputs["Rotation"]),
+              turned.inputs["Rotation"])
+
+    world = nodes.new("ShaderNodeVectorMath")
+    world.operation = "ADD"
+    links.new(turned.outputs["Vector"], world.inputs[0])
+    links.new(info.outputs["Location"], world.inputs[1])
+
+    distance = nodes.new("ShaderNodeVectorMath")
+    distance.operation = "DISTANCE"
+    links.new(world.outputs["Vector"], distance.inputs[0])
+    links.new(source.outputs["相机位置"], distance.inputs[1])
+
+    # --- width: k is "world units per unit of depth" ----------------------
+    width = nodes.new("ShaderNodeMath")
+    width.operation = "MULTIPLY"
+    links.new(distance.outputs["Value"], width.inputs[0])
+    links.new(source.outputs["k"], width.inputs[1])
+
+    # The push happens in local space, so the world width is divided by the
+    # import scale (|scale| / sqrt(3) for the usual uniform 0.08).
+    length = nodes.new("ShaderNodeVectorMath")
+    length.operation = "LENGTH"
+    links.new(info.outputs["Scale"], length.inputs[0])
+    unit = nodes.new("ShaderNodeMath")
+    unit.operation = "DIVIDE"
+    links.new(length.outputs["Value"], unit.inputs[0])
+    unit.inputs[1].default_value = math.sqrt(3.0)
+    local_width = nodes.new("ShaderNodeMath")
+    local_width.operation = "DIVIDE"
+    links.new(width.outputs[0], local_width.inputs[0])
+    links.new(unit.outputs[0], local_width.inputs[1])
+
+    offset = nodes.new("ShaderNodeVectorMath")
+    offset.operation = "SCALE"
+    links.new(normal.outputs["Normal"], offset.inputs[0])
+    links.new(local_width.outputs[0], offset.inputs[3])
+
+    moved = nodes.new("GeometryNodeSetPosition")
+    links.new(smooth.outputs["Geometry"], moved.inputs["Geometry"])
+    links.new(offset.outputs["Vector"], moved.inputs["Offset"])
+    flipped = nodes.new("GeometryNodeFlipFaces")
+    links.new(moved.outputs["Geometry"], flipped.inputs["Mesh"])
+    painted = nodes.new("GeometryNodeSetMaterial")
+    links.new(flipped.outputs["Mesh"], painted.inputs["Geometry"])
+    links.new(source.outputs["描边材质"], painted.inputs["Material"])
+    joined = nodes.new("GeometryNodeJoinGeometry")
+    links.new(source.outputs["Geometry"], joined.inputs["Geometry"])
+    links.new(painted.outputs["Geometry"], joined.inputs["Geometry"])
+    links.new(joined.outputs["Geometry"], sink.inputs["Geometry"])
+
+    tree["version"] = GROUP_VERSION
+    tree["self_socket"] = self_socket.identifier
+    tree["camera_socket"] = camera_socket.identifier
+    tree["material_socket"] = material_socket.identifier
+    tree["k_socket"] = k_socket.identifier
+    return tree
+
+
+def mark_edge_faces(obj):
+    """Write the per-face "may grow an outline" flag that the hull reads."""
+    mesh = obj.data
+    attribute = mesh.attributes.get(EDGE_ATTRIBUTE)
+    if attribute is None:
+        attribute = mesh.attributes.new(EDGE_ATTRIBUTE, "BOOLEAN", "FACE")
+    flags = [True if slot.material is None else not _no_edge_material(slot.material)
+             for slot in obj.material_slots]
+    values = []
+    for poly in mesh.polygons:
+        index = poly.material_index
+        values.append(int(flags[index]) if 0 <= index < len(flags) else 1)
+    attribute.data.foreach_set("value", values)
+    return sum(values)
+
+
+def _sensor_axis(data, rx, ry):
+    """The render extent the sensor is fitted against, and its sensor size.
+
+    ``sensor_fit`` decides which side of the sensor the lens value maps onto:
+    AUTO puts ``sensor_width`` on the longer side of the image, HORIZONTAL pins
+    it to the width and VERTICAL pins ``sensor_height`` to the height.  Using
+    width / rx unconditionally draws a line 1.5x too thick on a portrait
+    render, which is what made the preset camera's outline look heavy.
+    """
+    fit = getattr(data, "sensor_fit", "AUTO")
+    if fit == "VERTICAL":
+        return ry, data.sensor_height
+    if fit == "HORIZONTAL":
+        return rx, data.sensor_width
+    if rx >= ry:
+        return rx, data.sensor_width
+    return ry, data.sensor_width
+
+
+def pixel_k(pixels):
+    """World units of push per unit of depth, for the current camera."""
+    scene = bpy.context.scene
+    camera = scene.camera
+    if camera is None:
+        return max(0.0, float(pixels)) * 0.001
+    data = camera.data
+    rx = max(1, scene.render.resolution_x)
+    ry = max(1, scene.render.resolution_y)
+    extent, sensor = _sensor_axis(data, rx, ry)
+    return (max(0.0, float(pixels)) * max(sensor, 1e-6)
+            / (max(data.lens, 1e-6) * extent))
+
+
+def _input_paths(modifier, group, key):
+    """Where this release keeps a node-group input (5.x moved it off ID props)."""
+    identifier = group[key]
+    paths = ['modifiers["%s"]["%s"]' % (modifier.name, identifier)]
+    if hasattr(modifier, "properties"):
+        paths.append('modifiers["%s"].properties.inputs.%s.value'
+                     % (modifier.name, identifier))
+    return paths
+
+
+def set_input(modifier, group, key, value):
+    """Write a group input on a modifier across the 3.6 / 5.x API split."""
+    identifier = group[key]
+    try:
+        modifier[identifier] = value  # 3.6 - 4.x keep the inputs on ID properties
+        return True
+    except TypeError:
+        pass
+    try:  # 5.x: ``modifier.properties.inputs.<socket>.value``
+        getattr(modifier.properties.inputs, identifier).value = value
+        return True
+    except Exception:  # noqa: BLE001 - socket not there
         return False
-    index = len(slots)
-    obj.data.materials.append(material)
-    modifier = obj.modifiers.get(OUTLINE_MODIFIER)
-    if modifier is None:
-        modifier = obj.modifiers.new(OUTLINE_MODIFIER, "SOLIDIFY")
-    modifier.thickness = thickness
-    modifier.offset = 1.0
-    modifier.use_flip_normals = True
-    modifier.use_rim = False
-    modifier.use_even_offset = False
-    modifier.material_offset = index
+
+
+def _strip_drivers(obj, data_paths, indices):
+    if obj.animation_data is None:
+        return
+    for data_path in data_paths:
+        for index in indices:
+            try:
+                obj.driver_remove(data_path, index)
+            except Exception:  # noqa: BLE001 - nothing driven there
+                continue
+
+
+def _scene_variable(driver, name, data_path):
+    variable = driver.variables.new()
+    variable.name = name
+    variable.type = "SINGLE_PROP"
+    variable.targets[0].id_type = "SCENE"
+    variable.targets[0].id = bpy.context.scene
+    variable.targets[0].data_path = data_path
+
+
+def bind_width_driver(obj, modifier, group, pixels):
+    """Make ``k`` follow the lens / sensor / resolution, so pixels stay pixels."""
+    scene = bpy.context.scene
+    camera = scene.camera
+    if camera is None:
+        return False
+    paths = _input_paths(modifier, group, "k_socket")
+    _strip_drivers(obj, paths, (-1,))
+    driver = None
+    for data_path in paths:
+        try:
+            driver = obj.driver_add(data_path).driver
+            break
+        except Exception:  # noqa: BLE001 - this release refuses that path
+            continue
+    if driver is None:
+        return False
+    driver.type = "SCRIPTED"
+    for variable in list(driver.variables):
+        driver.variables.remove(variable)
+
+    _scene_variable(driver, "lens", "camera.data.lens")
+    _scene_variable(driver, "sensor_w", "camera.data.sensor_width")
+    _scene_variable(driver, "sensor_h", "camera.data.sensor_height")
+    _scene_variable(driver, "rx", "render.resolution_x")
+    _scene_variable(driver, "ry", "render.resolution_y")
+    fit = getattr(camera.data, "sensor_fit", "AUTO")
+    if fit == "VERTICAL":
+        expression = "%g * sensor_h / (lens * ry)"
+    elif fit == "HORIZONTAL":
+        expression = "%g * sensor_w / (lens * rx)"
+    else:
+        expression = "%g * sensor_w / (lens * max(rx, ry))"
+    driver.expression = expression % max(0.0, float(pixels))
+    return driver.is_simple_expression
+
+
+def bind_camera_position(obj, modifier, group):
+    """Follow ``scene.camera`` through drivers, so a camera swap is harmless."""
+    scene = bpy.context.scene
+    camera = scene.camera
+    paths = _input_paths(modifier, group, "camera_socket")
+    _strip_drivers(obj, paths, (0, 1, 2))
+    if camera is None:
+        return False
+    for axis in range(3):
+        driver = None
+        for data_path in paths:
+            try:
+                driver = obj.driver_add(data_path, axis).driver
+                break
+            except Exception:  # noqa: BLE001 - this release refuses that path
+                continue
+        if driver is None:
+            return False
+        driver.type = "SCRIPTED"
+        for variable in list(driver.variables):
+            driver.variables.remove(variable)
+        _scene_variable(driver, "v", "camera.location[%d]" % axis)
+        driver.expression = "v"
     return True
 
 
-def remove_hull_outline(obj):
+def add_outline(obj, pixels, color=OUTLINE_COLOR):
+    material = outline_material(color)
+    faces = mark_edge_faces(obj)
+    if faces == 0:
+        return False
+    slot_names = [slot.material.name for slot in obj.material_slots
+                  if slot.material is not None]
+    if material.name not in slot_names:
+        obj.data.materials.append(material)
     modifier = obj.modifiers.get(OUTLINE_MODIFIER)
-    if modifier is not None:
+    if modifier is not None and modifier.type != "NODES":
         obj.modifiers.remove(modifier)
+        modifier = None
+    if modifier is None:
+        modifier = obj.modifiers.new(OUTLINE_MODIFIER, "NODES")
+    group = outline_group()
+    modifier.node_group = group
+    set_input(modifier, group, "self_socket", obj)
+    camera = bpy.context.scene.camera
+    if camera is not None:
+        set_input(modifier, group, "camera_socket",
+                  tuple(camera.matrix_world.translation))
+    set_input(modifier, group, "material_socket", material)
+    set_input(modifier, group, "k_socket", pixel_k(pixels))
+    bind_width_driver(obj, modifier, group, pixels)
+    bind_camera_position(obj, modifier, group)
+    try:
+        obj.update_tag()
+    except Exception:  # noqa: BLE001 - not linked to a view layer yet
+        pass
+    return True
+
+
+def remove_outline(obj):
+    if obj.animation_data is not None:
+        curves = obj.animation_data.drivers
+        for curve in list(curves):
+            if 'modifiers["%s"]' % OUTLINE_MODIFIER in curve.data_path:
+                curves.remove(curve)
+    for name in (OUTLINE_MODIFIER, LEGACY_EDGE_MODIFIER):
+        modifier = obj.modifiers.get(name)
+        if modifier is not None:
+            obj.modifiers.remove(modifier)
+    legacy = obj.vertex_groups.get(LEGACY_EDGE_MODIFIER)
+    if legacy is not None:
+        obj.vertex_groups.remove(legacy)
+    attribute = obj.data.attributes.get(EDGE_ATTRIBUTE)
+    if attribute is not None:
+        obj.data.attributes.remove(attribute)
     material = bpy.data.materials.get(OUTLINE_MATERIAL)
     if material is None:
         return
@@ -491,103 +874,8 @@ def _activate(context, obj):
         return False
 
 
-def apply_edge_settings(meshes, width, color=OUTLINE_COLOR):
-    """Match mmd_tools' shell to the game's thin warm-brown line.
-
-    mmd_tools stores ``edge_weight * 0.02`` per vertex, so the modifier
-    thickness must be divided by that factor to get ``width`` metres of shell.
-    The edge material feeds its colour through a Gamma 2.2 node, hence the
-    ``** 2.2`` below: what the user picks is what the render shows.
-    """
-    thickness = max(0.0, float(width)) / EDGE_WEIGHT_FACTOR
-    for obj in meshes:
-        modifier = obj.modifiers.get(EDGE_MODIFIER)
-        if modifier is None:
-            continue
-        scale = obj.matrix_world.to_scale()
-        factor = max((abs(scale.x) + abs(scale.y) + abs(scale.z)) / 3.0, 1e-6)
-        modifier.thickness = thickness / factor
-        modifier.thickness_vertex_group = 1e-3
-        modifier.use_even_offset = False
-
-    write = tuple(min(1.0, max(0.0, float(value))) ** 2.2 for value in color[:3])
-    seen = set()
-    for obj in meshes:
-        for slot in obj.material_slots:
-            material = slot.material
-            if material is None or material.name in seen:
-                continue
-            if not material.name.startswith(EDGE_MATERIAL_PREFIX):
-                continue
-            seen.add(material.name)
-            if material.name == EDGE_MATERIAL_PREFIX + "disabled":
-                continue
-            material.diffuse_color = (float(color[0]), float(color[1]),
-                                      float(color[2]), 1.0)
-            if not material.use_nodes or material.node_tree is None:
-                continue
-            for node in material.node_tree.nodes:
-                if (node.bl_idname == "ShaderNodeGroup"
-                        and node.node_tree is not None
-                        and node.node_tree.name == "MMDEdgePreview"):
-                    for socket in node.inputs:
-                        if socket.type == "RGBA" and not socket.links:
-                            socket.default_value = (write[0], write[1], write[2], 1.0)
-
-
-def drop_disabled_edges(meshes):
-    """Zero the shell weight on vertices only surrounded by no-edge faces.
-
-    mmd_tools builds the shell for *every* vertex and merely covers the ones
-    with ``edge_flag = 0`` with a transparent material, so eyes and mouth still
-    get a full-thickness hull.  Clearing those weights removes the geometry.
-    Vertices shared with a drawn material keep their weight so the boundary is
-    not eaten away.
-    """
-    dropped = 0
-    for obj in meshes:
-        modifier = obj.modifiers.get(EDGE_MODIFIER)
-        if modifier is None:
-            continue
-        name = getattr(modifier, "vertex_group", "")
-        group = obj.vertex_groups.get(name) if name else None
-        if group is None:
-            continue
-        flags = []
-        for slot in obj.material_slots:
-            material = slot.material
-            flags.append(True if material is None else not _no_edge_material(material))
-        if all(flags):
-            continue
-        keep = {}
-        for poly in obj.data.polygons:
-            index = poly.material_index
-            wanted = flags[index] if 0 <= index < len(flags) else True
-            for vertex in poly.vertices:
-                keep[vertex] = keep.get(vertex, False) or wanted
-        victims = [vertex for vertex, wanted in keep.items() if not wanted]
-        if victims:
-            group.add(victims, 0.0, "REPLACE")
-            dropped += len(victims)
-    return dropped
-
-
-def add_mmd_outline(context, meshes, width, color=OUTLINE_COLOR):
-    operator = _mmd_edge_operator()
-    if operator is None or not meshes:
-        return False
-    if not _activate(context, meshes[0]):
-        return False
-    try:
-        operator(action="CREATE")
-    except Exception:  # noqa: BLE001 - let the hull fallback take over
-        return False
-    apply_edge_settings(meshes, width, color)
-    drop_disabled_edges(meshes)
-    return True
-
-
-def remove_mmd_outline(context, meshes):
+def _clear_legacy_mmd(context, meshes):
+    """Drop whatever v0.5.0 left behind: mmd_tools' edge preview shells."""
     operator = _mmd_edge_operator()
     if operator is not None and meshes and _activate(context, meshes[0]):
         try:
@@ -595,34 +883,31 @@ def remove_mmd_outline(context, meshes):
         except Exception:  # noqa: BLE001 - manual cleanup below still runs
             pass
     for obj in meshes:
-        modifier = obj.modifiers.get(EDGE_MODIFIER)
+        modifier = obj.modifiers.get(LEGACY_EDGE_MODIFIER)
         if modifier is not None:
             obj.modifiers.remove(modifier)
-        group = obj.vertex_groups.get(EDGE_MODIFIER)
+        group = obj.vertex_groups.get(LEGACY_EDGE_MODIFIER)
         if group is not None:
             obj.vertex_groups.remove(group)
     for material in list(bpy.data.materials):
-        if (material.name or "").startswith(EDGE_MATERIAL_PREFIX):
+        if (material.name or "").startswith(LEGACY_EDGE_PREFIX):
             try:
                 bpy.data.materials.remove(material)
             except Exception:  # noqa: BLE001 - still used by another scene
                 pass
 
 
-def setup_outline(context, meshes, width, color=OUTLINE_COLOR):
-    """Outlines through mmd_tools' edge preview, local hull as the fallback."""
+def setup_outline(context, meshes, width_px, color=OUTLINE_COLOR):
+    """Outlines as a depth-proportional hull, so the width stays in pixels."""
     clear_outline(context, meshes)
-    if add_mmd_outline(context, meshes, width, color):
-        return "mmd"
-    for obj in meshes:
-        add_hull_outline(obj, width, color)
-    return "hull"
+    built = [obj for obj in meshes if add_outline(obj, width_px, color)]
+    return "node" if built else "none"
 
 
 def clear_outline(context, meshes):
-    remove_mmd_outline(context, meshes)
+    _clear_legacy_mmd(context, meshes)
     for obj in meshes:
-        remove_hull_outline(obj)
+        remove_outline(obj)
 
 
 # ---------------------------------------------------------------------------

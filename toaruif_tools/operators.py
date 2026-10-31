@@ -330,22 +330,23 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
     bl_idname = "toaruif.setup_toon"
     bl_label = "一键卡通渲染"
     bl_description = ("把当前模型换成游戏风格的卡通着色：相机空间竖直条带做硬明暗分界、"
-                      "_mask 通道推动分界，再按游戏颜色套 mmd_tools 描边")
+                      "_mask 通道推动分界，再按游戏颜色加像素恒宽的描边")
     bl_options = {"REGISTER", "UNDO"}
 
     outline: bpy.props.BoolProperty(
         name="添加描边",
-        description="用 mmd_tools 的边缘预览加反向外壳描边（游戏同款暖褐色，约 1.8mm）",
+        description="按面法线生成反向外壳描边（游戏同款暖褐色），线宽按像素恒定",
         default=True,
     )
-    outline_width: bpy.props.FloatProperty(
-        name="描边宽度",
-        description="描边厚度（米）。1.8mm 约等于正常构图下的 1-2 像素",
-        default=toon.OUTLINE_WIDTH,
+    outline_pixels: bpy.props.FloatProperty(
+        name="描边宽度（像素）",
+        description="渲染画面里的描边宽度。按像素驱动，镜头拉近拉远线宽不变，"
+                    "不会出现近景糊成一条宽带",
+        default=toon.OUTLINE_PIXELS,
         min=0.0,
-        max=0.02,
-        precision=4,
-        subtype="DISTANCE",
+        max=8.0,
+        precision=2,
+        subtype="FACTOR",
     )
     outline_color: bpy.props.FloatVectorProperty(
         name="描边颜色",
@@ -417,7 +418,8 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
                 material = slot.material
                 if material is None:
                     continue
-                if material.name.startswith(toon.EDGE_MATERIAL_PREFIX):
+                if (material.name.startswith(toon.OUTLINE_MATERIAL)
+                        or material.name.startswith(toon.LEGACY_EDGE_PREFIX)):
                     continue
                 base = toon.base_image_of(material)
                 if base is None:
@@ -442,24 +444,24 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
         if shaded == 0:
             return _fail(self, "所有材质都没有基础颜色贴图，无法套用卡通渲染。")
 
-        outline_mode = None
-        if self.outline:
-            outline_mode = toon.setup_outline(context, meshes, self.outline_width,
-                                              tuple(self.outline_color))
-        else:
-            toon.clear_outline(context, meshes)
-
         engine = toon.ensure_engine(context.scene)
         toon.ensure_view_transform(context.scene)
         toon.ensure_world(context.scene)
         toon.ensure_light(context.scene)
         toon.ensure_camera(context.scene, meshes)
 
+        # The outline driver solves against the scene camera, so the camera has
+        # to exist before the shell is built.
+        outline_mode = None
+        if self.outline:
+            outline_mode = toon.setup_outline(context, meshes, self.outline_pixels,
+                                              tuple(self.outline_color))
+        else:
+            toon.clear_outline(context, meshes)
+
         message = "已应用卡通渲染：%d 个材质（%s）" % (shaded, engine)
-        if outline_mode == "mmd":
-            message += "，描边由 mmd_tools 边缘预览生成"
-        elif outline_mode == "hull":
-            message += "，mmd_tools 描边不可用，改用自建外壳"
+        if outline_mode == "node":
+            message += "，描边为按像素恒宽的几何节点外壳"
         if fallback:
             self.report({"WARNING"},
                         "%d 个材质没有找到 _mask 贴图，改用中性遮罩：%s"
