@@ -330,7 +330,8 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
     bl_idname = "toaruif.setup_toon"
     bl_label = "一键卡通渲染"
     bl_description = ("把当前模型换成游戏风格的卡通着色：相机空间竖直条带做硬明暗分界、"
-                      "_mask 通道推动分界，再按游戏颜色加像素恒宽的描边")
+                      "_mask 通道推动分界，再按游戏颜色加描边。默认只改材质与描边，"
+                      "环境（引擎、视图变换、灯光、相机）需在 F9 勾选「设置环境」")
     bl_options = {"REGISTER", "UNDO"}
 
     outline: bpy.props.BoolProperty(
@@ -370,6 +371,12 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
         min=0.0,
         max=30.0,
         precision=2,
+    )
+    setup_scene: bpy.props.BoolProperty(
+        name="设置环境",
+        description="同时切换渲染引擎、视图变换，并补上世界环境、主光与全身相机。"
+                    "默认关闭：只改材质与描边，场景环境保持原样",
+        default=False,
     )
     light_direction: bpy.props.FloatProperty(
         name="受光方向",
@@ -458,14 +465,17 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
         if shaded == 0:
             return _fail(self, "所有材质都没有基础颜色贴图，无法套用卡通渲染。")
 
-        engine = toon.ensure_engine(context.scene)
-        toon.ensure_view_transform(context.scene)
-        toon.ensure_world(context.scene)
-        toon.ensure_light(context.scene)
-        toon.ensure_camera(context.scene, meshes)
+        engine = context.scene.render.engine
+        if self.setup_scene:
+            engine = toon.ensure_engine(context.scene)
+            toon.ensure_view_transform(context.scene)
+            toon.ensure_world(context.scene)
+            toon.ensure_light(context.scene)
+            toon.ensure_camera(context.scene, meshes)
 
         # The outline driver solves against the scene camera, so the camera has
-        # to exist before the shell is built.
+        # to exist before the shell is built.  Without one the pixel width is
+        # just an approximation -- the bold mode does not need it at all.
         outline_mode = None
         bold = self.bold_width * 0.001 if self.outline_bold else 0.0
         if self.outline:
@@ -479,6 +489,8 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
             message += "，描边为固定 %.1f mm（近景更粗，还原游戏）" % self.bold_width
         elif outline_mode == "node":
             message += "，描边为按像素恒宽的几何节点外壳"
+        if not self.setup_scene:
+            message += "，环境未改动"
         if fallback:
             self.report({"WARNING"},
                         "%d 个材质没有找到 _mask 贴图，改用中性遮罩：%s"
