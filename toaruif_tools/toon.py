@@ -62,7 +62,7 @@ OUTLINE_MODIFIER = "ToaruIF-描边"
 OUTLINE_GROUP = "ToaruIF-描边节点"
 #: Bump whenever the node layout changes; the group is then rebuilt instead of
 #: reused, which keeps .blend files made by an older version working.
-GROUP_VERSION = 5
+GROUP_VERSION = 6
 #: Per-face boolean written on the mesh: this face may grow an outline.
 EDGE_ATTRIBUTE = "toaruif_edge"
 #: Left behind by v0.5.0, which borrowed mmd_tools' edge preview.  Only used to
@@ -142,6 +142,13 @@ STYLES = {
 # therefore driven from the camera distance and the focal terms, which keeps
 # the line the same few pixels at any framing.
 OUTLINE_PIXELS = 1.5
+#: The "bold" option draws the line as a fixed model-space thickness instead,
+#: which is what the game shader does (its outline is an extrusion scaled by
+#: _OutlineScaleTer, not a screen-space width).  Close-up shots therefore draw
+#: a visibly heavier line, exactly as they do in game.  Measured against the
+#: hull: 2.4 mm reads the same as the default 1.5 px from the preset camera's
+#: full-body framing, so the two buttons only differ when the camera moves in.
+OUTLINE_BOLD_MM = 2.4
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +527,8 @@ def outline_group():
     camera_socket = add_socket("相机位置", "INPUT", "NodeSocketVector")
     material_socket = add_socket("描边材质", "INPUT", "NodeSocketMaterial")
     k_socket = add_socket("k", "INPUT", "NodeSocketFloat")
+    pixels_socket = add_socket("像素恒定", "INPUT", "NodeSocketBool")
+    width_socket = add_socket("世界宽度", "INPUT", "NodeSocketFloat")
     add_socket("Geometry", "OUTPUT", "NodeSocketGeometry")
 
     source = nodes.new("NodeGroupInput")
@@ -629,6 +638,16 @@ def outline_group():
     links.new(depth_value, width.inputs[0])
     links.new(source.outputs["k"], width.inputs[1])
 
+    # Two ways to size the line.  Pixel-constant multiplies the depth by ``k``;
+    # the bold option uses a fixed world thickness, which is how the game shader
+    # works -- its line is a model-space extrusion, so it does get heavier as
+    # the camera moves in.  A switch keeps both in one hull.
+    sized = nodes.new("GeometryNodeSwitch")
+    sized.input_type = "FLOAT"
+    links.new(source.outputs["像素恒定"], sized.inputs["Switch"])
+    links.new(source.outputs["世界宽度"], sized.inputs["False"])
+    links.new(width.outputs[0], sized.inputs["True"])
+
     # The push happens in local space, so the world width is divided by the
     # import scale (|scale| / sqrt(3) for the usual uniform 0.08).
     length = nodes.new("ShaderNodeVectorMath")
@@ -640,7 +659,7 @@ def outline_group():
     unit.inputs[1].default_value = math.sqrt(3.0)
     local_width = nodes.new("ShaderNodeMath")
     local_width.operation = "DIVIDE"
-    links.new(width.outputs[0], local_width.inputs[0])
+    links.new(sized.outputs[0], local_width.inputs[0])
     links.new(unit.outputs[0], local_width.inputs[1])
 
     offset = nodes.new("ShaderNodeVectorMath")
@@ -666,6 +685,8 @@ def outline_group():
     tree["camera_socket"] = camera_socket.identifier
     tree["material_socket"] = material_socket.identifier
     tree["k_socket"] = k_socket.identifier
+    tree["pixel_socket"] = pixels_socket.identifier
+    tree["width_socket"] = width_socket.identifier
     return tree
 
 
@@ -826,7 +847,9 @@ def bind_camera_position(obj, modifier, group):
     return True
 
 
-def add_outline(obj, pixels, color=OUTLINE_COLOR):
+def add_outline(obj, pixels, color=OUTLINE_COLOR, bold=0.0):
+    """Build the hull.  ``bold`` is a fixed world thickness in metres; 0 keeps
+    the pixel-constant behaviour.  Both live in the same node group."""
     material = outline_material(color)
     faces = mark_edge_faces(obj)
     if faces == 0:
@@ -850,6 +873,9 @@ def add_outline(obj, pixels, color=OUTLINE_COLOR):
                   tuple(camera.matrix_world.translation))
     set_input(modifier, group, "material_socket", material)
     set_input(modifier, group, "k_socket", pixel_k(pixels))
+    bold = max(0.0, float(bold))
+    set_input(modifier, group, "pixel_socket", bold <= 0.0)
+    set_input(modifier, group, "width_socket", bold)
     bind_width_driver(obj, modifier, group, pixels)
     bind_camera_position(obj, modifier, group)
     try:
@@ -939,10 +965,14 @@ def _clear_legacy_mmd(context, meshes):
                 pass
 
 
-def setup_outline(context, meshes, width_px, color=OUTLINE_COLOR):
-    """Outlines as a depth-proportional hull, so the width stays in pixels."""
+def setup_outline(context, meshes, width_px, color=OUTLINE_COLOR, bold=0.0):
+    """Outlines as a hull in one of two width modes.
+
+    ``bold`` > 0 gives every mesh a fixed world-space thickness (the game look,
+    heavier in close-ups); 0 keeps the pixel-constant width.
+    """
     clear_outline(context, meshes)
-    built = [obj for obj in meshes if add_outline(obj, width_px, color)]
+    built = [obj for obj in meshes if add_outline(obj, width_px, color, bold)]
     return "node" if built else "none"
 
 

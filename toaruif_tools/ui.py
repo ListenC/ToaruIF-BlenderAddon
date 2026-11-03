@@ -37,7 +37,14 @@ class TOARUIF_PT_panel(bpy.types.Panel):
         box.label(text="需先选中模型；会替换材质节点并按游戏色加描边", icon="INFO")
         column = box.column(align=True)
         column.scale_y = 1.4
-        column.operator("toaruif.setup_toon", text="一键卡通渲染", icon="MATERIAL")
+        thin = column.operator("toaruif.setup_toon", text="细描边（线宽恒定）",
+                               icon="MATERIAL")
+        thin.outline_bold = False
+        bold = column.operator("toaruif.setup_toon", text="粗描边（游戏近景）",
+                               icon="MATERIAL")
+        bold.outline_bold = True
+        box.label(text="细描边：线宽以像素为单位固定，放大不变粗；", icon="INFO")
+        box.label(text="粗描边：按模型空间固定粗细，近景变粗，与游戏一致")
 
 
 def register():

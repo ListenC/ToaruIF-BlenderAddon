@@ -357,6 +357,20 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
         min=0.0,
         max=1.0,
     )
+    outline_bold: bpy.props.BoolProperty(
+        name="粗描边",
+        description="改用固定模型空间粗细的描边，还原游戏里近景描边变粗的效果；"
+                    "关闭则线宽按像素恒定",
+        default=False,
+    )
+    bold_width: bpy.props.FloatProperty(
+        name="粗描边厚度（毫米）",
+        description="粗描边模式下的固定粗细。默认 2.1 mm，等于细描边在预设全身构图下的线宽",
+        default=toon.OUTLINE_BOLD_MM,
+        min=0.0,
+        max=30.0,
+        precision=2,
+    )
     light_direction: bpy.props.FloatProperty(
         name="受光方向",
         description="明暗分界绕竖轴旋转：0.5 为正面受光，0.42 与 BV-Toon 预设一致",
@@ -453,14 +467,17 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
         # The outline driver solves against the scene camera, so the camera has
         # to exist before the shell is built.
         outline_mode = None
+        bold = self.bold_width * 0.001 if self.outline_bold else 0.0
         if self.outline:
             outline_mode = toon.setup_outline(context, meshes, self.outline_pixels,
-                                              tuple(self.outline_color))
+                                              tuple(self.outline_color), bold)
         else:
             toon.clear_outline(context, meshes)
 
         message = "已应用卡通渲染：%d 个材质（%s）" % (shaded, engine)
-        if outline_mode == "node":
+        if outline_mode == "node" and bold > 0.0:
+            message += "，描边为固定 %.1f mm（近景更粗，还原游戏）" % self.bold_width
+        elif outline_mode == "node":
             message += "，描边为按像素恒宽的几何节点外壳"
         if fallback:
             self.report({"WARNING"},
