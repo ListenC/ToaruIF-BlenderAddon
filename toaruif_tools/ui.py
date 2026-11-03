@@ -40,9 +40,11 @@ class TOARUIF_PT_panel(bpy.types.Panel):
         thin = column.operator("toaruif.setup_toon", text="细描边（线宽恒定）",
                                icon="MATERIAL")
         thin.outline_bold = False
+        thin.setup_scene = False
         bold = column.operator("toaruif.setup_toon", text="粗描边（游戏近景）",
                                icon="MATERIAL")
         bold.outline_bold = True
+        bold.setup_scene = False
         box.label(text="细描边：线宽以像素为单位固定，放大不变粗；", icon="INFO")
         box.label(text="粗描边：按模型空间固定粗细，近景变粗，与游戏一致")
         box.label(text="要一并切换引擎/世界/灯光/相机，按 F9 勾选「设置环境」")
