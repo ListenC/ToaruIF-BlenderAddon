@@ -1,52 +1,44 @@
 """One-click cel / toon shading preset for imported ToaruIF models.
 
-The game renders characters with a cel shader fed by three textures per part:
-the base colour map plus a ``_mask`` map whose channels are data, not colour.
-Sampling the shipped masks shows the layout:
+The game renders characters with ``Ter/Character/Toon*Ter``: two textures per
+part (``_MainTex`` albedo and ``_MaskTex``) plus a handful of material
+constants.  The mask is data, not colour, and the fragment shader only reads
+its red and green channels:
 
-* R stays at ~1.0 everywhere (a weight, not a picture)
-* G sits at 0.5 almost everywhere, with islands of 0 (face: eye/brow/lash
-  shapes, body: small pockets, hair: 19% of the texels) and 1.0 in hair
-* B is 0 except a few percent on the face (eye highlight)
-* A is fully opaque
+* G (0.5 neutral) is added straight into the terminator: ``a + G - 1``.  1
+  keeps a surface lit, 0 pins it in shadow for good -- which is exactly what
+  the painted brow / lash / eye-pocket islands are for
+* R and B are never sampled by any character variant (the eye highlight is
+  painted into the albedo)
 
-The 4x4 ``Orange.png`` shipped next to the textures is exactly (1.0, 0.5, 0.0)
--- the neutral value of those three channels -- so the intended default is
-"R=1, G=0.5, B=0".  That maps cleanly onto a cel shader:
+The shading is not taken from the scene lights.  ``_CharaLightDir`` is a fixed
+character light direction; the vertex stage hands the fragment
 
-* G = how much the surface takes shading (0.5 neutral, 0 = self-lit, 1 = extra
-  dark)
-* B = highlight amount
-* R = overall shadow weight
+    a   = clamp(dot(N_world, _CharaLightDir) + _LambertOffset, 0, 1)
+    f   = clamp((clamp(a + G - 1, 0, 1) - 0.34) / 0.07, 0, 1)
+    X   = albedo^4 + f * (albedo - albedo^4)
+    out = albedo * (L*(1 + M*(f-1)) + A*(1 + M*(X-1)))
 
-The shipped character materials confirm that much: they bind exactly two
-textures (``_MainTex`` + ``_MaskTex``) and the shader's property list is
-``_MainTex, _MaskTex, _LambertOffset, _ToonShadeMask, _RimColor, _RimScale,
-_RimOffset, _OutlineScaleTer, _OutlineOffsetTer, _OutlineZBiasTer,
-_OutlineColor, _Alpha`` -- the face variant adds ``_EyebrowsZShiftRate`` and
-the projected-light one adds ``_ProjLightTex / Scale / WorldScale``.  There is
-no ramp texture, so the break is computed from the light response plus those
-constants.  Everything else on the material (``_Color``, ``_AmbientLightColor``,
-``_Mode``, ``_Glossiness`` ...) is a Standard-shader leftover and is absent
-from that list, which is why it is ignored here as well.
-
-The light/shadow break is not driven by the scene lights.  Following BV-Toon's
-approach, a *vertical band* is built from the camera-space normal: the normal's
-horizontal components are dotted with a light direction that can be rotated
-with one number, and a narrow soft step turns that into a hard cel terminator.
-That makes the look deterministic -- rotating the view does not turn the
-character into a different time of day -- and the ``_ToonShadeMask`` still moves
-the break per texel through the mask's green channel.
+with ``M = _ToonShadeMask`` and ``L`` / ``A`` Unity's ``_LightColor0`` /
+``_AmbientLightColor``.  Because the break sits on a world-space dot product it
+stays put when the camera orbits, and the ``albedo^4`` term keeps the ambient
+light on bright albedo -- white cloth does not go muddy in shadow.  This preset
+reproduces those four lines directly; the earlier camera-space band could not
+(its terminator followed the view, and a per-part tint replaced the two-light
+blend).
 
 The outline is an inverted hull built in geometry nodes, not a solidify shell.
-Each face that may grow an edge is duplicated, welded smooth, pushed along its
-normal by a distance proportional to its depth from the camera and then flipped;
-the projection divides by the same depth, so the line keeps a constant width in
-*pixels* whatever the framing.  The width is driven from the lens / sensor /
-resolution, so a close-up no longer turns the line into a fat band.  In the 3D
-view the reference point is the view origin instead of the render camera, so
-scrolling in and out of the viewport keeps the same width too.  Faces of eyes,
-brows, lashes and mouth are flagged out of the hull by a face attribute.
+The game shader draws it in a ``Cull Front`` pass whose vertex offset is
+``(clipZ * _OutlineScaleTer + _OutlineOffsetTer) * 0.01`` -- after the
+perspective divide that is a screen-constant part plus a world-space part over
+depth.  The hull reproduces the screen-constant half with a depth-proportional
+push (so the line keeps its width in *pixels* whatever the framing) and the
+bold option adds a fixed world thickness on top, which is what makes close-ups
+heavier exactly as in game.  The width is driven from the lens / sensor /
+resolution; in the 3D view the reference point is the view origin instead of
+the render camera, so scrolling in and out of the viewport keeps the same
+width too.  Faces of eyes, brows, lashes and mouth are flagged out of the hull
+by a face attribute.
 """
 
 import math
@@ -62,7 +54,7 @@ OUTLINE_MODIFIER = "ToaruIF-描边"
 OUTLINE_GROUP = "ToaruIF-描边节点"
 #: Bump whenever the node layout changes; the group is then rebuilt instead of
 #: reused, which keeps .blend files made by an older version working.
-GROUP_VERSION = 6
+GROUP_VERSION = 7
 #: Per-face boolean written on the mesh: this face may grow an outline.
 EDGE_ATTRIBUTE = "toaruif_edge"
 #: Left behind by v0.5.0, which borrowed mmd_tools' edge preview.  Only used to
@@ -73,18 +65,23 @@ LEGACY_EDGE_PREFIX = "mmd_edge."
 # Constants read out of the shipped character materials
 # (model_base_004000901_* / 004001501_* in the asset bundles).  They are the
 # defaults the game ships with, so a fresh preset lands on the same numbers.
-TOON_SHADE_MASK = 0.35    # _ToonShadeMask -- weight of the mask green channel
-#: BV-Toon's preset values.  The break is near-hard (0.04 on a -1..1 band is a
-#: couple of degrees) and the light comes from the upper left.
+TOON_SHADE_MASK = 0.35    # _ToonShadeMask -- weight of the light/ambient blend
+LAMBERT_OFFSET = 0.40     # _LambertOffset -- where the break sits on the dot
+#: The fragment shader's break: f = clamp((clamp(a + G - 1) - 0.34) / 0.07).
+BREAK_THRESHOLD = 0.34
+BREAK_WIDTH = 0.07
+#: Horizontal angle of the character light, 0..1 (0.5 straight ahead); 0.42
+#: leans it to the left, which is where the shipped character light sits.  The
+#: game's ``_CharaLightDir`` is a full 3D direction, so an elevation is added
+#: too -- the previous camera-space band dropped it entirely and could never
+#: shade the top or the underside of anything.
 LIGHT_DIRECTION = 0.42
-BREAK_WIDTH = 0.04
-#: Band value the terminator sits on.  ``_LambertOffset`` (0.4) is an offset on
-#: a dot product in the game, while the band above is a camera-space normal
-#: component -- different quantities, so it cannot be reused verbatim.  BV-Toon
-#: cuts at 0.5 and a front facing model then only darkens near the silhouette
-#: (a thin rim, no visible two-tone). Parked near 0 the terminator runs through
-#: the open surface, which is what makes the cel look read at a glance.
-BREAK_CENTRE = 0.05
+LIGHT_ELEVATION = 25.0
+#: Unity's ``_LightColor0`` / ``_AmbientLightColor``.  They sum to 1, so a fully
+#: lit surface renders exactly as the albedo, the same as before.  Kept constant
+#: on purpose: the preset must look identical whatever the scene lights are.
+LIGHT_COLOR = (0.75, 0.75, 0.75)
+AMBIENT_COLOR = (0.25, 0.25, 0.25)
 RIM_COLOR = (1.0, 1.0, 1.0, 1.0)  # _RimColor
 RIM_SCALE = 0.0           # _RimScale -- 0 in the assets; see the note below
 RIM_OFFSET = 0.0          # _RimOffset -- shifts where the rim starts
@@ -119,21 +116,12 @@ NO_EDGE_NAME_HINTS = ("瞳", "目", "眉", "睫", "口", "齿", "歯", "舌", "�
                       "teeth", "tongue", "lip")
 
 # Per part style.  body / hair / face are picked from the base texture name.
-# The shadow is the base texture pushed toward ``shadow_tint``; that tint is a
-# hand tuned darkening, the game itself has no shadow-colour parameter.
+# The game has no per-part shading constants, so the only entry left is the
+# strength of the optional mask-B highlight -- an extra no shader variant does.
 STYLES = {
-    "face": {
-        "shadow_tint": (0.72, 0.44, 0.44, 1.0),
-        "specular": 0.30,
-    },
-    "hair": {
-        "shadow_tint": (0.40, 0.30, 0.52, 1.0),
-        "specular": 0.45,
-    },
-    "body": {
-        "shadow_tint": (0.32, 0.28, 0.52, 1.0),
-        "specular": 0.20,
-    },
+    "face": {"specular": 0.30},
+    "hair": {"specular": 0.45},
+    "body": {"specular": 0.20},
 }
 
 # Outline width in *rendered pixels*, not metres.  A solidify shell has a world
@@ -142,12 +130,11 @@ STYLES = {
 # therefore driven from the camera distance and the focal terms, which keeps
 # the line the same few pixels at any framing.
 OUTLINE_PIXELS = 1.5
-#: The "bold" option draws the line as a fixed model-space thickness instead,
-#: which is what the game shader does (its outline is an extrusion scaled by
-#: _OutlineScaleTer, not a screen-space width).  Close-up shots therefore draw
-#: a visibly heavier line, exactly as they do in game.  Measured against the
-#: hull: 2.4 mm reads the same as the default 1.5 px from the preset camera's
-#: full-body framing, so the two buttons only differ when the camera moves in.
+#: The "bold" option adds a fixed model-space thickness *on top of* the pixel
+#: width, mirroring the game shader (its outline offset is ``clipZ *
+#: _OutlineScaleTer + _OutlineOffsetTer``, i.e. a screen-constant part plus a
+#: world-space part over depth).  The line never vanishes at distance and still
+#: grows into a visibly heavier band as the camera moves in.
 OUTLINE_BOLD_MM = 2.4
 
 
@@ -212,7 +199,13 @@ def mask_image_for(image, part):
 
 
 def _load(path):
-    return bpy.data.images.load(path, check_existing=True)
+    image = bpy.data.images.load(path, check_existing=True)
+    # The mask channels are data, not colour.  Doing this here, right after the
+    # load, also avoids touching the colours space of an image that only exists
+    # in memory: assigning a new one re-generates the buffer and would blank it.
+    if image.colorspace_settings.name != "Non-Color":
+        image.colorspace_settings.name = "Non-Color"
+    return image
 
 
 def ensure_default_mask():
@@ -222,8 +215,9 @@ def ensure_default_mask():
     if image is not None:
         return image
     image = bpy.data.images.new(name, width=4, height=4, alpha=True)
-    image.pixels = [1.0, 0.5, 0.0, 1.0] * 16
+    # Colours space first: changing it later clears a generated image in 5.x.
     image.colorspace_settings.name = "Non-Color"
+    image.pixels = [1.0, 0.5, 0.0, 1.0] * 16
     image.use_fake_user = True
     return image
 
@@ -264,14 +258,16 @@ def build_toon_material(material, base_image, mask_image, style_key, style,
                         mask_strength=TOON_SHADE_MASK,
                         light_direction=LIGHT_DIRECTION,
                         break_width=BREAK_WIDTH,
-                        break_centre=BREAK_CENTRE, rim_scale=RIM_SCALE):
+                        lambert_offset=LAMBERT_OFFSET,
+                        rim_scale=RIM_SCALE, mask_highlight=False):
     """Rebuild the material as the game's two-tone character shader.
 
-    The terminator comes from a camera-space vertical band (BV-Toon), so it
-    follows ``light_direction`` instead of the scene lights.  ``mask_strength``
-    is ``_ToonShadeMask``: the green channel of ``_mask`` moves that break per
-    texel -- 0 (painted shadow islands) darkens, 1 (always-lit) brightens and
-    0.5 is neutral.
+    Every step follows the shipped fragment shader instead of an approximation:
+    the break sits on a world-space dot product, the ``_mask`` green channel
+    enters it at full weight, and the two light terms are blended with
+    ``_ToonShadeMask`` around an ``albedo^4`` ambient guard.  ``break_width`` is
+    the shader's 0.07 wide step and ``lambert_offset`` the ``_LambertOffset``
+    added to the dot product.
     """
     tree = material.node_tree
     tree.nodes.clear()
@@ -291,141 +287,264 @@ def build_toon_material(material, base_image, mask_image, style_key, style,
     mask_tex = nodes.new("ShaderNodeTexImage")
     mask_tex.location = (-1150, -350)
     mask_tex.image = mask_image
-    if mask_image.colorspace_settings.name != "Non-Color":
-        mask_image.colorspace_settings.name = "Non-Color"
 
     separate = nodes.new("ShaderNodeSeparateColor")
     separate.location = (-900, -350)
     links.new(mask_tex.outputs["Color"], separate.inputs["Color"])
 
-    # --- camera-space vertical band --------------------------------------
-    # BV-Toon's band: the camera-space normal's horizontal component *only*
-    # (the up/down one is dropped, so the band stays vertical however the
-    # camera is tilted), scaled by the light direction.  Surfaces whose
-    # horizontal normal points away from the light land in shadow -- a true
-    # vertical terminator, not a Fresnel ring.
+    # --- a = clamp(dot(N_world, _CharaLightDir) + _LambertOffset, 0, 1) -----
+    # A fixed character light, not the scene's sun, and a full 3D dot: dropping
+    # the vertical component (as the old camera-space band did) leaves the top
+    # and the underside of every part shaded alike, and makes the terminator
+    # follow the camera instead of staying on the model.
+    azimuth = (light_direction - 0.5) * math.pi
+    elevation = math.radians(LIGHT_ELEVATION)
+    direction = (math.sin(azimuth) * math.cos(elevation),
+                 -math.cos(azimuth) * math.cos(elevation),
+                 math.sin(elevation))
+
     geometry = nodes.new("ShaderNodeNewGeometry")
     geometry.location = (-1150, 0)
 
-    to_camera = nodes.new("ShaderNodeVectorTransform")
-    to_camera.vector_type = "NORMAL"
-    to_camera.convert_from = "WORLD"
-    to_camera.convert_to = "CAMERA"
-    to_camera.location = (-950, 0)
+    dot = nodes.new("ShaderNodeVectorMath")
+    dot.operation = "DOT_PRODUCT"
+    dot.location = (-900, 0)
+    dot.inputs[1].default_value = direction
+    links.new(geometry.outputs["Normal"], dot.inputs[0])
+
+    lambert = nodes.new("ShaderNodeMath")
+    lambert.name = "toon_lit"
+    lambert.location = (-700, 0)
+    lambert.operation = "ADD"
+    lambert.use_clamp = True
+    links.new(dot.outputs["Value"], lambert.inputs[0])
+    lambert.inputs[1].default_value = lambert_offset
+
+    # --- f = clamp((clamp(a + G - 1, 0, 1) - 0.34) / 0.07, 0, 1) ----------
+    # G enters at full weight: 1 keeps a texel lit, 0 pins it in shadow, so the
+    # painted brow / lash islands stay dark whatever the light does.  Only
+    # _ToonShadeMask scales the light/ambient blend below, never this break.
+    plus_mask = nodes.new("ShaderNodeMath")
+    plus_mask.location = (-520, 0)
+    plus_mask.operation = "ADD"
+    links.new(lambert.outputs[0], plus_mask.inputs[0])
+    links.new(separate.outputs["Green"], plus_mask.inputs[1])
+
+    minus_one = nodes.new("ShaderNodeMath")
+    minus_one.location = (-360, 0)
+    minus_one.operation = "SUBTRACT"
+    minus_one.use_clamp = True
+    minus_one.inputs[1].default_value = 1.0
+    links.new(plus_mask.outputs[0], minus_one.inputs[0])
+
+    threshold = nodes.new("ShaderNodeMath")
+    threshold.location = (-200, 0)
+    threshold.operation = "SUBTRACT"
+    threshold.inputs[1].default_value = BREAK_THRESHOLD
+    links.new(minus_one.outputs[0], threshold.inputs[0])
+
+    lit = nodes.new("ShaderNodeMath")
+    lit.name = "toon_lit_factor"
+    lit.location = (-40, 0)
+    lit.operation = "DIVIDE"
+    lit.use_clamp = True
+    lit.inputs[1].default_value = max(1e-3, break_width)
+    links.new(threshold.outputs[0], lit.inputs[0])
+
+    # --- X = albedo^4 + f * (albedo - albedo^4) ---------------------------
+    # Bright albedo keeps almost all of its ambient term; that guard is what
+    # stops white cloth, hats and scarves from going muddy in shadow.
+    square = nodes.new("ShaderNodeVectorMath")
+    square.operation = "MULTIPLY"
+    square.location = (-700, 320)
+    links.new(tex.outputs["Color"], square.inputs[0])
+    links.new(tex.outputs["Color"], square.inputs[1])
+
+    fourth = nodes.new("ShaderNodeVectorMath")
+    fourth.operation = "MULTIPLY"
+    fourth.location = (-520, 320)
+    links.new(square.outputs["Vector"], fourth.inputs[0])
+    links.new(square.outputs["Vector"], fourth.inputs[1])
+
+    delta = nodes.new("ShaderNodeVectorMath")
+    delta.operation = "SUBTRACT"
+    delta.location = (-360, 320)
+    links.new(tex.outputs["Color"], delta.inputs[0])
+    links.new(fourth.outputs["Vector"], delta.inputs[1])
+
+    weighed = nodes.new("ShaderNodeVectorMath")
+    weighed.operation = "SCALE"
+    weighed.location = (-200, 320)
+    links.new(delta.outputs["Vector"], weighed.inputs[0])
+    links.new(lit.outputs[0],
+              _socket(weighed, weighed.inputs, "Scale", "VALUE"))
+
+    spread = nodes.new("ShaderNodeVectorMath")
+    spread.operation = "ADD"
+    spread.location = (-40, 320)
+    links.new(fourth.outputs["Vector"], spread.inputs[0])
+    links.new(weighed.outputs["Vector"], spread.inputs[1])
+
+    # --- albedo * (L*(1 + M*(f-1)) + A*(1 + M*(X-1))) ---------------------
+    # Expanded to (L+A)*(1-M) + M*(L*f + A*X): one constant floor plus the two
+    # masked light terms.  No per-part shadow tints -- the shader has none, the
+    # only colour left in shadow is the light and ambient colour itself.
+    weight = max(0.0, min(1.0, mask_strength))
+    lit_gain = nodes.new("ShaderNodeVectorMath")
+    lit_gain.operation = "SCALE"
+    lit_gain.location = (150, 250)
+    lit_gain.inputs[0].default_value = LIGHT_COLOR
+    links.new(lit.outputs[0],
+              _socket(lit_gain, lit_gain.inputs, "Scale", "VALUE"))
+
+    ambient = nodes.new("ShaderNodeVectorMath")
+    ambient.operation = "MULTIPLY"
+    ambient.location = (150, 90)
+    ambient.inputs[0].default_value = AMBIENT_COLOR
+    links.new(spread.outputs["Vector"], ambient.inputs[1])
+
+    blend = nodes.new("ShaderNodeVectorMath")
+    blend.operation = "ADD"
+    blend.location = (340, 170)
+    links.new(lit_gain.outputs["Vector"], blend.inputs[0])
+    links.new(ambient.outputs["Vector"], blend.inputs[1])
+
+    masked = nodes.new("ShaderNodeVectorMath")
+    masked.operation = "SCALE"
+    masked.location = (530, 170)
+    links.new(blend.outputs["Vector"], masked.inputs[0])
+    _socket(masked, masked.inputs, "Scale", "VALUE").default_value = weight
+
+    floor = nodes.new("ShaderNodeRGB")
+    floor.location = (530, 330)
+    floor.outputs["Color"].default_value = tuple(
+        (light + ambient_light) * (1.0 - weight)
+        for light, ambient_light in zip(LIGHT_COLOR, AMBIENT_COLOR)) + (1.0,)
+
+    combined = nodes.new("ShaderNodeVectorMath")
+    combined.operation = "ADD"
+    combined.location = (720, 230)
+    links.new(floor.outputs["Color"], combined.inputs[0])
+    links.new(masked.outputs["Vector"], combined.inputs[1])
+
+    shaded = nodes.new("ShaderNodeVectorMath")
+    shaded.name = "toon_shaded"
+    shaded.operation = "MULTIPLY"
+    shaded.location = (900, 230)
+    links.new(tex.outputs["Color"], shaded.inputs[0])
+    links.new(combined.outputs["Vector"], shaded.inputs[1])
+
+    # --- optional highlight from the mask's blue channel ------------------
+    # No character variant samples the blue channel, so this is an extra the
+    # user has to ask for; off by default to match the game.
+    graded = shaded.outputs["Vector"]
+    if mask_highlight:
+        spec_scale = nodes.new("ShaderNodeMath")
+        spec_scale.location = (900, -250)
+        spec_scale.operation = "MULTIPLY"
+        spec_scale.inputs[1].default_value = style["specular"]
+        links.new(separate.outputs["Blue"], spec_scale.inputs[0])
+
+        highlight, hi_a, hi_b, hi_result = _mix_color(nodes, "ADD")
+        highlight.location = (1080, -80)
+        links.new(shaded.outputs["Vector"], hi_a)
+        hi_b.default_value = (1.0, 1.0, 1.0, 1.0)
+        links.new(spec_scale.outputs[0],
+                  _socket(highlight, highlight.inputs, "Factor", "VALUE"))
+        graded = hi_result
+
+    # --- rim: s = _RimScale * clamp((w + 0.5)^2 - 0.5, 0, 1) --------------
+    # w = 1 - clamp(N_view.z - _RimOffset, 0, 1) in Unity's view space, where a
+    # camera-facing normal is -Z; Blender's camera space flips that sign, hence
+    # the negation.  The colour is base + s*(2*_RimColor - base), so s = 0.5
+    # lands exactly on the rim colour.  _RimScale is 0 in the shipped
+    # materials: the game only raises it at runtime through
+    # InGameCharacterObject.SetRimSettings.
+    view_normal = nodes.new("ShaderNodeVectorTransform")
+    view_normal.vector_type = "NORMAL"
+    view_normal.convert_from = "WORLD"
+    view_normal.convert_to = "CAMERA"
+    view_normal.location = (700, -520)
+    links.new(geometry.outputs["Normal"], view_normal.inputs["Vector"])
 
     split = nodes.new("ShaderNodeSeparateXYZ")
-    split.location = (-750, 0)
+    split.location = (880, -520)
+    links.new(view_normal.outputs["Vector"], split.inputs["Vector"])
 
-    angle = (light_direction - 0.5) * math.pi * 2.0
-    band = nodes.new("ShaderNodeMath")
-    band.name = "toon_band"
-    band.location = (-550, 0)
-    band.operation = "MULTIPLY"
-    band.inputs[1].default_value = math.cos(angle)
-    links.new(split.outputs["X"], band.inputs[0])
+    away = nodes.new("ShaderNodeMath")
+    away.location = (1040, -520)
+    away.operation = "MULTIPLY"
+    away.inputs[1].default_value = -1.0
+    links.new(split.outputs["Z"], away.inputs[0])
 
-    links.new(geometry.outputs["Normal"], to_camera.inputs["Vector"])
-    links.new(to_camera.outputs["Vector"], split.inputs["Vector"])
+    rim_start = nodes.new("ShaderNodeMath")
+    rim_start.location = (1200, -520)
+    rim_start.operation = "SUBTRACT"
+    rim_start.use_clamp = True
+    rim_start.inputs[1].default_value = RIM_OFFSET
+    links.new(away.outputs[0], rim_start.inputs[0])
 
-    # G moves the break: 0.5 is neutral, 0 keeps the painted islands (brows,
-    # lashes, body pockets) lit and 1 pushes the hair / cloth strands darker.
-    bias = nodes.new("ShaderNodeMath")
-    bias.location = (-350, -300)
-    bias.operation = "SUBTRACT"
-    bias.inputs[1].default_value = 0.5
-    links.new(separate.outputs["Green"], bias.inputs[0])
+    rim_weight = nodes.new("ShaderNodeMath")
+    rim_weight.location = (1360, -520)
+    rim_weight.operation = "SUBTRACT"
+    rim_weight.inputs[0].default_value = 1.0
+    links.new(rim_start.outputs[0], rim_weight.inputs[1])
 
-    shift = nodes.new("ShaderNodeMath")
-    shift.location = (-150, -300)
-    shift.operation = "MULTIPLY"
-    shift.inputs[1].default_value = 2.0 * max(0.0, min(1.0, mask_strength))
-    links.new(bias.outputs[0], shift.inputs[0])
+    rim_half = nodes.new("ShaderNodeMath")
+    rim_half.location = (1520, -520)
+    rim_half.operation = "ADD"
+    rim_half.inputs[1].default_value = 0.5
+    links.new(rim_weight.outputs[0], rim_half.inputs[0])
 
-    broken = nodes.new("ShaderNodeMath")
-    broken.location = (30, 0)
-    broken.operation = "ADD"
-    links.new(band.outputs[0], broken.inputs[0])
-    links.new(shift.outputs[0], broken.inputs[1])
+    rim_square = nodes.new("ShaderNodeMath")
+    rim_square.location = (1680, -520)
+    rim_square.operation = "MULTIPLY"
+    links.new(rim_half.outputs[0], rim_square.inputs[0])
+    links.new(rim_half.outputs[0], rim_square.inputs[1])
 
-    # shadow = clamp((band - (break_centre - width/2)) / width): a near-hard
-    # terminator parked inside the visible surface, nudged per texel by the mask.
-    centre = break_centre - max(1e-3, break_width) * 0.5
-    step = nodes.new("ShaderNodeMath")
-    step.location = (260, 0)
-    step.operation = "SUBTRACT"
-    links.new(broken.outputs[0], step.inputs[0])
-    step.inputs[1].default_value = centre
-
-    shadow = nodes.new("ShaderNodeMath")
-    shadow.name = "toon_shadow"
-    shadow.location = (440, 0)
-    shadow.operation = "DIVIDE"
-    shadow.use_clamp = True
-    shadow.inputs[1].default_value = max(1e-3, break_width)
-    links.new(step.outputs[0], shadow.inputs[0])
-
-    # --- colours ---------------------------------------------------------
-    shade_node, shade_a, shade_b, shade_result = _mix_color(nodes, "MULTIPLY", 1.0)
-    shade_node.location = (300, -160)
-    tint = nodes.new("ShaderNodeRGB")
-    tint.location = (80, -230)
-    tint.outputs["Color"].default_value = style["shadow_tint"]
-    links.new(tex.outputs["Color"], shade_a)
-    links.new(tint.outputs["Color"], shade_b)
-
-    final_node, final_a, final_b, final_result = _mix_color(nodes, "MIX")
-    final_node.location = (640, 0)
-    links.new(tex.outputs["Color"], final_a)
-    links.new(shade_result, final_b)
-    links.new(shadow.outputs[0],
-              _socket(final_node, final_node.inputs, "Factor", "VALUE"))
-
-    # --- highlight from the mask's blue channel --------------------------
-    spec_scale = nodes.new("ShaderNodeMath")
-    spec_scale.location = (460, -300)
-    spec_scale.operation = "MULTIPLY"
-    spec_scale.inputs[1].default_value = style["specular"]
-    links.new(separate.outputs["Blue"], spec_scale.inputs[0])
-
-    highlight, hi_a, hi_b, hi_result = _mix_color(nodes, "ADD")
-    highlight.location = (760, -60)
-    links.new(final_result, hi_a)
-    hi_b.default_value = (1.0, 1.0, 1.0, 1.0)
-    links.new(spec_scale.outputs[0], _socket(highlight, highlight.inputs, "Factor", "VALUE"))
-
-    # --- rim light -------------------------------------------------------
-    # _RimScale is 0 in the shipped materials: the game only raises it at
-    # runtime (InGameCharacterObject.SetRimSettings, tweened through a
-    # MaterialPropertyBlock), so it ships here as an explicit strength and
-    # stays off at its default.
-    fresnel = nodes.new("ShaderNodeFresnel")
-    fresnel.location = (300, -480)
-    fresnel.inputs["IOR"].default_value = 1.45
-
-    rim_ramp = nodes.new("ShaderNodeMapRange")
-    rim_ramp.location = (480, -480)
-    rim_ramp.interpolation_type = "SMOOTHSTEP"
-    rim_ramp.clamp = True
-    rim_ramp.inputs["From Min"].default_value = RIM_OFFSET
-    rim_ramp.inputs["From Max"].default_value = 1.0
-    rim_ramp.inputs["To Min"].default_value = 0.0
-    rim_ramp.inputs["To Max"].default_value = 1.0
-    links.new(fresnel.outputs["Fac"], rim_ramp.inputs["Value"])
+    rim_ramp = nodes.new("ShaderNodeMath")
+    rim_ramp.location = (1840, -520)
+    rim_ramp.operation = "SUBTRACT"
+    rim_ramp.use_clamp = True
+    rim_ramp.inputs[1].default_value = 0.5
+    links.new(rim_square.outputs[0], rim_ramp.inputs[0])
 
     rim_gain = nodes.new("ShaderNodeMath")
-    rim_gain.location = (660, -480)
+    rim_gain.location = (2000, -520)
     rim_gain.operation = "MULTIPLY"
     rim_gain.inputs[1].default_value = max(0.0, rim_scale)
-    links.new(rim_ramp.outputs["Result"], rim_gain.inputs[0])
+    links.new(rim_ramp.outputs[0], rim_gain.inputs[0])
 
-    rim_add, rim_a, rim_b, rim_result = _mix_color(nodes, "ADD")
-    rim_add.location = (880, -80)
-    links.new(hi_result, rim_a)
-    rim_b.default_value = RIM_COLOR
+    rim_color = nodes.new("ShaderNodeRGB")
+    rim_color.location = (1840, -350)
+    rim_color.outputs["Color"].default_value = RIM_COLOR
+
+    rim_double = nodes.new("ShaderNodeVectorMath")
+    rim_double.operation = "SCALE"
+    rim_double.location = (2000, -350)
+    links.new(rim_color.outputs["Color"], rim_double.inputs[0])
+    _socket(rim_double, rim_double.inputs, "Scale", "VALUE").default_value = 2.0
+
+    rim_delta = nodes.new("ShaderNodeVectorMath")
+    rim_delta.operation = "SUBTRACT"
+    rim_delta.location = (2170, -300)
+    links.new(rim_double.outputs["Vector"], rim_delta.inputs[0])
+    links.new(graded, rim_delta.inputs[1])
+
+    rim_scaled = nodes.new("ShaderNodeVectorMath")
+    rim_scaled.operation = "SCALE"
+    rim_scaled.location = (2340, -300)
+    links.new(rim_delta.outputs["Vector"], rim_scaled.inputs[0])
     links.new(rim_gain.outputs[0],
-              _socket(rim_add, rim_add.inputs, "Factor", "VALUE"))
+              _socket(rim_scaled, rim_scaled.inputs, "Scale", "VALUE"))
 
-    links.new(rim_result, emit.inputs["Color"])
+    rim_result = nodes.new("ShaderNodeVectorMath")
+    rim_result.operation = "ADD"
+    rim_result.location = (2510, -200)
+    links.new(graded, rim_result.inputs[0])
+    links.new(rim_scaled.outputs["Vector"], rim_result.inputs[1])
+
+    links.new(rim_result.outputs["Vector"], emit.inputs["Color"])
 
     material[TOON_KEY] = style_key
     material.use_backface_culling = False
@@ -638,15 +757,22 @@ def outline_group():
     links.new(depth_value, width.inputs[0])
     links.new(source.outputs["k"], width.inputs[1])
 
-    # Two ways to size the line.  Pixel-constant multiplies the depth by ``k``;
-    # the bold option uses a fixed world thickness, which is how the game shader
-    # works -- its line is a model-space extrusion, so it does get heavier as
-    # the camera moves in.  A switch keeps both in one hull.
-    sized = nodes.new("GeometryNodeSwitch")
-    sized.input_type = "FLOAT"
-    links.new(source.outputs["像素恒定"], sized.inputs["Switch"])
-    links.new(source.outputs["世界宽度"], sized.inputs["False"])
-    links.new(width.outputs[0], sized.inputs["True"])
+    # Two width terms.  The pixel-constant part multiplies the depth by ``k``;
+    # the game's outline offset is actually ``clipZ * _OutlineScaleTer +
+    # _OutlineOffsetTer``, i.e. that screen-constant part *plus* a fixed world
+    # thickness over depth.  The bold option therefore adds the world term on
+    # top instead of replacing it -- the thin option keeps it at zero, and the
+    # line never shrinks away at distance the way a pure world-space hull does.
+    world = nodes.new("GeometryNodeSwitch")
+    world.input_type = "FLOAT"
+    links.new(source.outputs["像素恒定"], world.inputs["Switch"])
+    links.new(source.outputs["世界宽度"], world.inputs["False"])
+    world.inputs["True"].default_value = 0.0  # thin: pixels only
+
+    sized = nodes.new("ShaderNodeMath")
+    sized.operation = "ADD"
+    links.new(width.outputs[0], sized.inputs[0])
+    links.new(world.outputs[0], sized.inputs[1])
 
     # The push happens in local space, so the world width is divided by the
     # import scale (|scale| / sqrt(3) for the usual uniform 0.08).
@@ -848,8 +974,8 @@ def bind_camera_position(obj, modifier, group):
 
 
 def add_outline(obj, pixels, color=OUTLINE_COLOR, bold=0.0):
-    """Build the hull.  ``bold`` is a fixed world thickness in metres; 0 keeps
-    the pixel-constant behaviour.  Both live in the same node group."""
+    """Build the hull.  ``pixels`` is the screen-constant width, ``bold`` a
+    world thickness added on top of it; 0 leaves the line pixel-only."""
     material = outline_material(color)
     faces = mark_edge_faces(obj)
     if faces == 0:
@@ -968,8 +1094,9 @@ def _clear_legacy_mmd(context, meshes):
 def setup_outline(context, meshes, width_px, color=OUTLINE_COLOR, bold=0.0):
     """Outlines as a hull in one of two width modes.
 
-    ``bold`` > 0 gives every mesh a fixed world-space thickness (the game look,
-    heavier in close-ups); 0 keeps the pixel-constant width.
+    ``bold`` > 0 adds a fixed world-space thickness to the pixel-constant
+    width, which is how the game shader's outline behaves (heavier in
+    close-ups); 0 keeps the line pixel-only.
     """
     clear_outline(context, meshes)
     built = [obj for obj in meshes if add_outline(obj, width_px, color, bold)]

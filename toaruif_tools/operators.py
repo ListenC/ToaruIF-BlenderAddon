@@ -329,8 +329,9 @@ class TOARUIF_OT_import_vmd(bpy.types.Operator, ImportHelper):
 class TOARUIF_OT_setup_toon(bpy.types.Operator):
     bl_idname = "toaruif.setup_toon"
     bl_label = "一键卡通渲染"
-    bl_description = ("把当前模型换成游戏风格的卡通着色：相机空间竖直条带做硬明暗分界、"
-                      "_mask 通道推动分界，再按游戏颜色加描边。默认只改材质与描边，"
+    bl_description = ("把当前模型换成游戏风格的卡通着色：按 shader 的世界空间角色光做"
+                      "硬明暗分界，_mask 绿通道全强度推动分界，再按 _ToonShadeMask "
+                      "合成受光与环境两项，最后按游戏颜色加描边。默认只改材质与描边，"
                       "环境（引擎、视图变换、灯光、相机）需在 F9 勾选「设置环境」")
     bl_options = {"REGISTER", "UNDO"}
 
@@ -360,13 +361,12 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
     )
     outline_bold: bpy.props.BoolProperty(
         name="粗描边",
-        description="改用固定模型空间粗细的描边，还原游戏里近景描边变粗的效果；"
-                    "关闭则线宽按像素恒定",
+        description="在像素恒定线宽上再叠加固定模型空间厚度，还原游戏里近景描边变粗的效果",
         default=False,
     )
     bold_width: bpy.props.FloatProperty(
         name="粗描边厚度（毫米）",
-        description="粗描边模式下的固定粗细。默认 2.1 mm，等于细描边在预设全身构图下的线宽",
+        description="粗描边模式下叠加的世界厚度。默认 2.4 mm，近景明显加粗、远景仍保留像素线宽",
         default=toon.OUTLINE_BOLD_MM,
         min=0.0,
         max=30.0,
@@ -380,7 +380,7 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
     )
     light_direction: bpy.props.FloatProperty(
         name="受光方向",
-        description="明暗分界绕竖轴旋转：0.5 为正面受光，0.42 与 BV-Toon 预设一致",
+        description="角色光绕竖轴的水平角：0.5 为正面受光，0.42 与游戏 _CharaLightDir 一致",
         default=toon.LIGHT_DIRECTION,
         min=0.0,
         max=1.0,
@@ -388,28 +388,33 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
     )
     break_width: bpy.props.FloatProperty(
         name="分界宽度",
-        description="明暗分界的柔和度；越小越像游戏里的硬两段，越大越柔和",
+        description="明暗分界的柔和度；游戏 shader 为 0.07（接近硬切），越大越柔和",
         default=toon.BREAK_WIDTH,
         min=0.001,
         max=0.5,
         subtype="FACTOR",
     )
-    break_centre: bpy.props.FloatProperty(
-        name="分界位置",
-        description="明暗分界落在哪里：越小阴影面积越大，越大越靠近剪影；"
-                    "0.1 是明显的两段卡通效果",
-        default=toon.BREAK_CENTRE,
-        min=-0.5,
+    lambert_offset: bpy.props.FloatProperty(
+        name="分界偏移（_LambertOffset）",
+        description="明暗分界在点积上的偏移；游戏材质实测 0.4，越大受光面积越大",
+        default=toon.LAMBERT_OFFSET,
+        min=0.0,
         max=1.0,
         subtype="FACTOR",
     )
     mask_strength: bpy.props.FloatProperty(
         name="遮罩强度",
-        description="对应 _ToonShadeMask：_mask 绿通道对明暗分界的推动力度"
-                    "（0 = 只看光照，默认 0.35 与游戏材质一致）",
+        description="对应 _ToonShadeMask：受光/环境两项的混合权重，不参与分界计算"
+                    "（默认 0.35 与游戏材质一致）",
         default=toon.TOON_SHADE_MASK,
         min=0.0,
         max=1.0,
+    )
+    mask_highlight: bpy.props.BoolProperty(
+        name="遮罩高光（非游戏行为）",
+        description="按 _mask 蓝通道叠加白色高光。所有角色 shader 变体都不读蓝通道，"
+                    "默认关闭以还原游戏效果",
+        default=False,
     )
     rim_strength: bpy.props.FloatProperty(
         name="边缘光强度",
@@ -458,8 +463,9 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
                                          self.mask_strength,
                                          light_direction=self.light_direction,
                                          break_width=self.break_width,
-                                         break_centre=self.break_centre,
-                                         rim_scale=self.rim_strength)
+                                         lambert_offset=self.lambert_offset,
+                                         rim_scale=self.rim_strength,
+                                         mask_highlight=self.mask_highlight)
                 shaded += 1
 
         if shaded == 0:
