@@ -25,7 +25,9 @@ stays put when the camera orbits, and the ``albedo^4`` term keeps the ambient
 light on bright albedo -- white cloth does not go muddy in shadow.  This preset
 reproduces those four lines directly; the earlier camera-space band could not
 (its terminator followed the view, and a per-part tint replaced the two-light
-blend).
+blend).  That camera-space frame survives as an option: with it on the dot is
+taken in view space, so the terminator keeps its screen placement and turns
+with the camera instead.
 
 The outline is an inverted hull built in geometry nodes, not a solidify shell.
 The game shader draws it in a ``Cull Front`` pass whose vertex offset is
@@ -259,12 +261,13 @@ def build_toon_material(material, base_image, mask_image, style_key, style,
                         light_direction=LIGHT_DIRECTION,
                         break_width=BREAK_WIDTH,
                         lambert_offset=LAMBERT_OFFSET,
-                        rim_scale=RIM_SCALE, mask_highlight=False):
+                        rim_scale=RIM_SCALE, mask_highlight=False,
+                        light_follows_camera=False):
     """Rebuild the material as the game's two-tone character shader.
 
     Every step follows the shipped fragment shader instead of an approximation:
-    the break sits on a world-space dot product, the ``_mask`` green channel
-    enters it at full weight, and the two light terms are blended with
+    the break sits on a dot product of the surface normal, the ``_mask`` green
+    channel enters it at full weight, and the two light terms are blended with
     ``_ToonShadeMask`` around an ``albedo^4`` ambient guard.  ``break_width`` is
     the shader's 0.07 wide step and ``lambert_offset`` the ``_LambertOffset``
     added to the dot product.
@@ -294,23 +297,85 @@ def build_toon_material(material, base_image, mask_image, style_key, style,
 
     # --- a = clamp(dot(N_world, _CharaLightDir) + _LambertOffset, 0, 1) -----
     # A fixed character light, not the scene's sun, and a full 3D dot: dropping
-    # the vertical component (as the old camera-space band did) leaves the top
-    # and the underside of every part shaded alike, and makes the terminator
-    # follow the camera instead of staying on the model.
+    # the vertical component leaves the top and the underside of every part
+    # shaded alike.  The reference frame is selectable: world space is what the
+    # game does (the break stays on the model while the camera orbits), camera
+    # space keeps it pinned to the screen and turns it with the view.
     azimuth = (light_direction - 0.5) * math.pi
     elevation = math.radians(LIGHT_ELEVATION)
-    direction = (math.sin(azimuth) * math.cos(elevation),
-                 -math.cos(azimuth) * math.cos(elevation),
-                 math.sin(elevation))
+    cos_el = math.cos(elevation)
 
     geometry = nodes.new("ShaderNodeNewGeometry")
     geometry.location = (-1150, 0)
 
+    if light_follows_camera:
+        # The camera's axes are rebuilt from the incoming view vector rather
+        # than taken from a Vector Transform node, which does not report a
+        # stable camera space in every engine.  ``toward`` is surface -> camera,
+        # ``right`` and ``up`` complete the screen frame, and the same horizontal
+        # angle / elevation as the world light is measured from that frame.
+        toward = geometry.outputs["Incoming"]
+
+        right = nodes.new("ShaderNodeVectorMath")
+        right.operation = "CROSS_PRODUCT"
+        right.location = (-1000, -220)
+        right.inputs[0].default_value = (0.0, 0.0, 1.0)
+        links.new(toward, right.inputs[1])
+
+        right_unit = nodes.new("ShaderNodeVectorMath")
+        right_unit.operation = "NORMALIZE"
+        right_unit.location = (-850, -220)
+        links.new(right.outputs["Vector"], right_unit.inputs[0])
+
+        up = nodes.new("ShaderNodeVectorMath")
+        up.operation = "CROSS_PRODUCT"
+        up.location = (-1000, -360)
+        links.new(toward, up.inputs[0])
+        links.new(right_unit.outputs["Vector"], up.inputs[1])
+
+        terms = []
+        amounts = (math.cos(azimuth) * cos_el,
+                   math.sin(azimuth) * cos_el,
+                   math.sin(elevation))
+        for index, (socket, amount) in enumerate(zip(
+                (toward, right_unit.outputs["Vector"], up.outputs["Vector"]),
+                amounts)):
+            term = nodes.new("ShaderNodeVectorMath")
+            term.operation = "SCALE"
+            term.location = (-690, -220 - 140 * index)
+            links.new(socket, term.inputs[0])
+            _socket(term, term.inputs, "Scale", "VALUE").default_value = amount
+            terms.append(term)
+
+        first_sum = nodes.new("ShaderNodeVectorMath")
+        first_sum.operation = "ADD"
+        first_sum.location = (-530, -220)
+        links.new(terms[0].outputs["Vector"], first_sum.inputs[0])
+        links.new(terms[1].outputs["Vector"], first_sum.inputs[1])
+
+        second_sum = nodes.new("ShaderNodeVectorMath")
+        second_sum.operation = "ADD"
+        second_sum.location = (-370, -220)
+        links.new(first_sum.outputs["Vector"], second_sum.inputs[0])
+        links.new(terms[2].outputs["Vector"], second_sum.inputs[1])
+
+        light_dir = nodes.new("ShaderNodeVectorMath")
+        light_dir.name = "toon_light_dir"
+        light_dir.operation = "NORMALIZE"
+        light_dir.location = (-210, -220)
+        links.new(second_sum.outputs["Vector"], light_dir.inputs[0])
+
     dot = nodes.new("ShaderNodeVectorMath")
     dot.operation = "DOT_PRODUCT"
     dot.location = (-900, 0)
-    dot.inputs[1].default_value = direction
     links.new(geometry.outputs["Normal"], dot.inputs[0])
+    if light_follows_camera:
+        links.new(light_dir.outputs["Vector"], dot.inputs[1])
+    else:
+        dot.inputs[1].default_value = (
+            math.sin(azimuth) * cos_el,
+            -math.cos(azimuth) * cos_el,
+            math.sin(elevation))
 
     lambert = nodes.new("ShaderNodeMath")
     lambert.name = "toon_lit"

@@ -47,7 +47,7 @@ class TOARUIF_PT_panel(bpy.types.Panel):
         bold.setup_scene = False
         box.label(text="细描边：像素恒定线宽，放大不变粗", icon="INFO")
         box.label(text="粗描边：像素线宽 + 模型空间厚度，近景更粗（游戏公式）")
-        box.label(text="F9 可改分界偏移/遮罩强度/边缘光；遮罩高光默认关闭")
+        box.label(text="F9 可改分界偏移/遮罩强度/边缘光/光照随镜头")
         box.label(text="勾选「设置环境」才会切换引擎/世界/灯光/相机")
 
 

@@ -17,7 +17,7 @@ dot(N, _CharaLightDir) + _LambertOffset 做 0.07 宽的硬分界，_mask 绿通�
 bl_info = {
     "name": "幻想收束模型工具 (ToaruIF Model Tools)",
     "author": "ToaruIF Model",
-    "version": (0, 5, 5),
+    "version": (0, 5, 6),
     "blender": (3, 6, 0),
     "location": "3D 视图 > 侧栏 > 幻想收束",
     "description": "《魔法禁书目录 幻想收束》模型工具：PMX 2.1 降级导入、表情装载、VMD 动作、一键卡通渲染",

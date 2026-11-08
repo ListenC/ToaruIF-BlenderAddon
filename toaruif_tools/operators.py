@@ -386,6 +386,13 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
         max=1.0,
         subtype="FACTOR",
     )
+    light_follows_camera: bpy.props.BoolProperty(
+        name="光照随镜头",
+        description="明暗分界的参考系：关闭时方向固定在世界空间（随场景，与游戏一致，"
+                    "相机绕角色转时阴影留在同一侧）；打开后改从相机空间取方向，"
+                    "分界固定在画面上并跟着视角一起转",
+        default=False,
+    )
     break_width: bpy.props.FloatProperty(
         name="分界宽度",
         description="明暗分界的柔和度；游戏 shader 为 0.07（接近硬切），越大越柔和",
@@ -465,7 +472,8 @@ class TOARUIF_OT_setup_toon(bpy.types.Operator):
                                          break_width=self.break_width,
                                          lambert_offset=self.lambert_offset,
                                          rim_scale=self.rim_strength,
-                                         mask_highlight=self.mask_highlight)
+                                         mask_highlight=self.mask_highlight,
+                                         light_follows_camera=self.light_follows_camera)
                 shaded += 1
 
         if shaded == 0:
